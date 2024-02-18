@@ -1,0 +1,32 @@
+public int[] twoSum(int[] nums, int target)
+{
+  map<interger,Interger> storeNums = new HashMap<>(nums.length, 1);
+  //构建hashMap
+  int[]result = new int[2];
+  //构建一个数组，用于返回index
+  for(int i=0;i<num.length;i++)
+    {
+      int another = target-num[i];
+      //构建一个整数another，通过for循环来计算具体another的值
+      Integer anotherIndex=storeNums.get(another);
+      //通过get方法尝试在数组中找到another的具体位置
+      if(null!=anotherindex)
+      {
+        //如果anotherIndex部位null，则代表已经找到
+        result[0]=anotherIndex;
+        result[1]=i;
+      }
+      else
+      {
+        //如果anotherIndex为空，则代表未找到，则将此刻的值通过put方法写入hashMap内
+        storeNums.put(nums[i],i);
+        //nums[i]代表具体的value，i则代表hashMap的key，也可以理解为索引
+      }
+    }
+  return result;
+  }
+}
+使用hashMap用于寻找在列表中的两数之和为target的两个数字index
+这样的代码时间复杂度为线性复杂度，相比于双重for循环的暴力算法更加简洁
+
+
