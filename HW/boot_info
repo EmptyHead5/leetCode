@@ -143,15 +143,7 @@ def read16bytesforPartitions(path,part,offset):
                 })
     return results
 
-# -----------------------------------------------------------------------------
-# Generative AI Acknowledgment:
-#   Portions of the code in this project were generated with assistance from
-#   ChatGPT, an AI tool developed by OpenAI.
-#
-# Reference:
-#  OpenAI. (2024). ChatGPT [Large language model]. openai.com/chatgpt
-# -----------------------------------------------------------------------------
-
+#this print16bytesforPartitions use ChatGPT formatting
 def print16bytesforPartitions(snips):
     for s in snips:
         print(f"Partition number: {s['index']}")
@@ -185,14 +177,6 @@ def gptPartitions(path):
                 })
     return parts
 
-# -----------------------------------------------------------------------------
-# Generative AI Used: ChatGPT (OpenAI, Oct 22, 2025)
-# Purpose:
-#   This function was generated using ChatGPT to print GPT partition details
-#   in the required format for the assignment.
-# Reference:
-#   OpenAI. (2024). ChatGPT [Large language model]. https://openai.com/chatgpt
-# -----------------------------------------------------------------------------
 def print_gpt_lines(parts):
         for p in parts:
             print(f"Partition number: {p['Partition Number']}")
@@ -222,7 +206,7 @@ if __name__ == "__main__":
     scheme = detectScheme(filename)
 
     if scheme == "MBR":
-        #print("MBR Partition Detected")
+        print("MBR Partition Detected")
         partitions = mbrPartitions(filename)
         print("MBR Partitions:")
         print_mbr_lines(partitions)
@@ -230,7 +214,7 @@ if __name__ == "__main__":
         print("16 Bytes from Partition Offsets:")
         print16bytesforPartitions(snips)
     elif scheme == "GPT":
-        #print("GPT Partition Detected")
+        print("GPT Partition Detected")
         partitions = gptPartitions(filename)
         print("GPT Partitions:")
         print_gpt_lines(partitions)
@@ -241,8 +225,7 @@ if __name__ == "__main__":
     #MBR_TYPES = loadMbrTypes("PartitionTypes.csv")
     #print(MBR_TYPES)
 
-    # print("Partition Scheme:", scheme)
-    # print("MD5:    ", hashes["md5"])
-    # print("SHA-256: ", hashes["sha256"])
-    # print("SHA-512: ", hashes["sha512"])
-
+    print("Partition Scheme:", scheme)
+    print("MD5:    ", hashes["md5"])
+    print("SHA-256: ", hashes["sha256"])
+    print("SHA-512: ", hashes["sha512"])
