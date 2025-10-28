@@ -1,0 +1,621 @@
+# bchoc.py (starter framework)
+
+#!/usr/bin/env python3
+"""
+Blockchain Chain of Custody (bchoc) — starter framework
+Python 3.8+ (Ubuntu 18.04 compatible)
+
+This is a scaffold that compiles/runs and wires up CLI commands, file layout,
+block binary format, env vars, and error-code conventions. Fill in the TODOs to
+complete logic for add/checkout/checkin/remove/show/verify/summary.
+
+Notes:
+- Reads blockchain file path from env `BCHOC_FILE_PATH`, else defaults to `./blockchain.dat`.
+- AES key is hard-coded per spec. AES-ECB helpers are stubbed; plug in PyCryptodome
+  (recommended) or your own AES-ECB implementation.
+- Exit codes: 0 = success, 1 = error (spec). You can extend with more codes.
+- Timestamps are stored as UTC epoch seconds with fractional part (`double`).
+- Structure pack format: "32s d 32s 32s 12s 12s 12s I" (matches spec alignment).
+"""
+
+import argparse
+import base64
+import binascii
+import enum
+import hashlib
+import os
+import struct
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+# --------------------------- Constants & Config ---------------------------
+
+# File path from env
+BCHOC_FILE_PATH = os.environ.get("BCHOC_FILE_PATH", os.path.join(os.getcwd(), "blockchain.dat"))
+
+# Password env vars (read at runtime)
+PASSWORD_ENV_VARS = {
+    "POLICE": os.environ.get("BCHOC_PASSWORD_POLICE"),
+    "LAWYER": os.environ.get("BCHOC_PASSWORD_LAWYER"),
+    "ANALYST": os.environ.get("BCHOC_PASSWORD_ANALYST"),
+    "EXECUTIVE": os.environ.get("BCHOC_PASSWORD_EXECUTIVE"),
+    "CREATOR": os.environ.get("BCHOC_PASSWORD_CREATOR"),
+}
+
+# AES key (given)
+AES_KEY_B64_LITERAL = b"R0chLi4uLi4uLi4="  # per spec; provided as bytes literal
+# Use as raw bytes for AES key (key sizes: 16/24/32). You must decode/normalize.
+AES_KEY_RAW = base64.b64decode(AES_KEY_B64_LITERAL)
+
+# State field is 12 bytes, padded with NULs per spec
+class State(bytes, enum.Enum):
+    INITIAL = b"INITIAL"  # will be padded when packed
+    CHECKEDIN = b"CHECKEDIN"
+    CHECKEDOUT = b"CHECKEDOUT"
+    DISPOSED = b"DISPOSED"
+    DESTROYED = b"DESTROYED"
+    RELEASED = b"RELEASED"
+
+# Struct format for fixed header fields
+# 32s (prev_hash) | d (timestamp) | 32s (case_id) | 32s (evidence_id) |
+# 12s (state) | 12s (creator) | 12s (owner) | I (data_length)
+FIXED_FMT = "32s d 32s 32s 12s 12s 12s I"
+FIXED_SIZE = struct.calcsize(FIXED_FMT)
+
+# --------------------------- Utilities ---------------------------
+
+def pad12(b: bytes) -> bytes:
+    return (b or b"")[:12].ljust(12, b"\x00")
+
+
+def ts_utc_now() -> float:
+    # UTC epoch seconds (float). Spec: store UTC and account for TZ.
+    return time.time()
+
+
+def sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+# ---- AES-ECB helpers (stub: replace with PyCryptodome for production) ----
+# To pass grading, install/use PyCryptodome (python3-pycryptodome) and
+# implement real AES-ECB. Placeholders below do reversible XOR (NOT SECURE).
+# Update README/Makefile if you add dependencies.
+
+_BLOCK = 16
+
+
+def _pkcs7_pad(b: bytes, block: int = _BLOCK) -> bytes:
+    n = block - (len(b) % block)
+    return b + bytes([n]) * n
+
+
+def _pkcs7_unpad(b: bytes) -> bytes:
+    if not b:
+        return b
+    n = b[-1]
+    if n < 1 or n > _BLOCK:
+        return b
+    return b[:-n]
+
+
+def aes_ecb_encrypt(raw: bytes) -> bytes:
+    # TODO: replace with real AES-ECB using PyCryptodome
+    # from Crypto.Cipher import AES
+    # cipher = AES.new(AES_KEY_RAW, AES.MODE_ECB)
+    # return cipher.encrypt(_pkcs7_pad(raw))
+    k = AES_KEY_RAW
+    raw_p = _pkcs7_pad(raw)
+    out = bytearray()
+    for i in range(0, len(raw_p), _BLOCK):
+        blk = bytearray(raw_p[i : i + _BLOCK])
+        for j in range(_BLOCK):
+            blk[j] ^= k[j % len(k)]
+        out.extend(blk)
+    return bytes(out)
+
+
+def aes_ecb_decrypt(enc: bytes) -> bytes:
+    # TODO: replace with real AES-ECB using PyCryptodome
+    k = AES_KEY_RAW
+    out = bytearray()
+    for i in range(0, len(enc), _BLOCK):
+        blk = bytearray(enc[i : i + _BLOCK])
+        for j in range(_BLOCK):
+            blk[j] ^= k[j % len(k)]
+        out.extend(blk)
+    return _pkcs7_unpad(bytes(out))
+
+
+# Case ID: UUID string -> 32-byte encrypted payload for storage/display rules
+
+def encode_case_id(uuid_str: str) -> bytes:
+    # Validate UUID
+    _ = uuid.UUID(uuid_str)
+    raw = uuid.UUID(uuid_str).bytes  # 16 bytes
+    enc = aes_ecb_encrypt(raw)
+    return enc[:32].ljust(32, b"\x00")  # store in 32 bytes field
+
+
+def decode_case_id(enc32: bytes) -> str:
+    raw = aes_ecb_decrypt(enc32.rstrip(b"\x00"))
+    try:
+        return str(uuid.UUID(bytes=raw[:16]))
+    except Exception:
+        return binascii.hexlify(enc32).decode()
+
+
+# Item ID: 4-byte int -> encrypted then stored in 32-byte field per spec note
+
+def encode_item_id(item_id: int) -> bytes:
+    raw = struct.pack("!I", item_id)
+    enc = aes_ecb_encrypt(raw)
+    return enc[:32].ljust(32, b"\x00")
+
+
+def decode_item_id(enc32: bytes) -> Optional[int]:
+    raw = aes_ecb_decrypt(enc32.rstrip(b"\x00"))
+    try:
+        return struct.unpack("!I", raw[:4])[0]
+    except Exception:
+        return None
+
+
+# --------------------------- Block Model ---------------------------
+
+@dataclass
+class Block:
+    prev_hash: bytes  # 32
+    timestamp: float  # 8 (double)
+    case_id: bytes  # 32 (encrypted or zeroes)
+    evidence_id: bytes  # 32 (encrypted or zeroes)
+    state: bytes  # 12 (NUL padded)
+    creator: bytes  # 12 (NUL padded)
+    owner: bytes  # 12 (NUL padded)
+    data: bytes  # variable; length in header
+
+    def pack(self) -> bytes:
+        header = struct.pack(
+            FIXED_FMT,
+            self.prev_hash,
+            self.timestamp,
+            self.case_id,
+            self.evidence_id,
+            pad12(self.state),
+            pad12(self.creator),
+            pad12(self.owner),
+            len(self.data),
+        )
+        return header + self.data
+
+    @staticmethod
+    def unpack(buf: bytes) -> Tuple["Block", int]:
+        if len(buf) < FIXED_SIZE:
+            raise ValueError("buffer too small for block header")
+        (prev_hash, ts, case_id, evidence_id, state, creator, owner, dlen) = struct.unpack(
+            FIXED_FMT, buf[:FIXED_SIZE]
+        )
+        total = FIXED_SIZE + dlen
+        if len(buf) < total:
+            raise ValueError("buffer too small for block data")
+        data = buf[FIXED_SIZE:total]
+        return (
+            Block(prev_hash, ts, case_id, evidence_id, state.rstrip(b"\x00"), creator.rstrip(b"\x00"), owner.rstrip(b"\x00"), data),
+            total,
+        )
+
+    def header_for_hash(self) -> bytes:
+        # Hash over header fields excluding prev_hash; a common pattern is to hash the full packed block with prev_hash zeroed.
+        # You can choose your scheme; be consistent in verify().
+        ph_zero = b"\x00" * 32
+        header = struct.pack(
+            FIXED_FMT,
+            ph_zero,
+            self.timestamp,
+            self.case_id,
+            self.evidence_id,
+            pad12(self.state),
+            pad12(self.creator),
+            pad12(self.owner),
+            len(self.data),
+        )
+        return header + self.data
+
+    def hash(self) -> bytes:
+        return sha256(self.header_for_hash())
+
+
+# --------------------------- Blockchain Storage ---------------------------
+
+class Blockchain:
+    def __init__(self, path: str):
+        self.path = path
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def read_all(self) -> List[Block]:
+        blocks: List[Block] = []
+        if not self.exists():
+            return blocks
+        with open(self.path, "rb") as f:
+            buf = f.read()
+        off = 0
+        while off < len(buf):
+            blk, n = Block.unpack(buf[off:])
+            blocks.append(blk)
+            off += n
+        return blocks
+
+    def append(self, blk: Block) -> None:
+        with open(self.path, "ab") as f:
+            f.write(blk.pack())
+
+    def last_hash(self) -> bytes:
+        blks = self.read_all()
+        if not blks:
+            return b"\x00" * 32
+        return blks[-1].hash()
+
+
+# --------------------------- AuthN / AuthZ ---------------------------
+
+OWNERS = {"POLICE", "LAWYER", "ANALYST", "EXECUTIVE", "CREATOR"}
+
+
+def _role_for_password(pw: Optional[str]) -> Optional[str]:
+    if not pw:
+        return None
+    for role, env_pw in PASSWORD_ENV_VARS.items():
+        if env_pw and pw == env_pw:
+            return role
+    return None
+
+
+def require_owner(pw: str) -> str:
+    role = _role_for_password(pw)
+    if role in OWNERS:
+        return role  # authorized
+    print("> Invalid password", file=sys.stdout)
+    sys.exit(1)
+
+
+def require_creator(pw: str) -> str:
+    role = _role_for_password(pw)
+    if role == "CREATOR":
+        return role
+    print("> Invalid password", file=sys.stdout)
+    sys.exit(1)
+
+
+# --------------------------- Command Handlers ---------------------------
+
+
+def cmd_init(chain: Blockchain) -> None:
+    if not chain.exists():
+        # Create INITIAL block
+        blk = Block(
+            prev_hash=b"\x00" * 32,
+            timestamp=0.0,
+            case_id=b"0" * 32,
+            evidence_id=b"0" * 32,
+            state=pad12(b"INITIAL"),
+            creator=b"\x00" * 12,
+            owner=b"\x00" * 12,
+            data=b"Initial block\x00",
+        )
+        with open(chain.path, "wb") as f:
+            f.write(blk.pack())
+        print("> Blockchain file not found. Created INITIAL block.")
+        sys.exit(0)
+    else:
+        # Validate first block looks like INITIAL
+        blks = chain.read_all()
+        if blks and blks[0].state.startswith(b"INITIAL"):
+            print("> Blockchain file found with INITIAL block.")
+            sys.exit(0)
+        else:
+            print("> ERROR: blockchain exists but INITIAL block invalid.")
+            sys.exit(1)
+
+
+def cmd_add(chain: Blockchain, case_id: str, item_ids: List[int], creator: str, pw: str) -> None:
+    require_creator(pw)
+    # TODO: enforce uniqueness of item_id, set initial state CHECKEDIN
+    now = ts_utc_now()
+    for iid in item_ids:
+        blk = Block(
+            prev_hash=chain.last_hash(),
+            timestamp=now,
+            case_id=encode_case_id(case_id),
+            evidence_id=encode_item_id(iid),
+            state=pad12(b"CHECKEDIN"),
+            creator=pad12(creator.encode()),
+            owner=pad12(b""),
+            data=b"",  # optional extra data
+        )
+        chain.append(blk)
+        print(f"> Added item: {iid}")
+        print("> Status: CHECKEDIN")
+        print(f"> Time of action: {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))}Z")
+    sys.exit(0)
+
+
+def cmd_checkout(chain: Blockchain, item_id: int, pw: str) -> None:
+    role = require_owner(pw)
+    # TODO: ensure item exists, current state allows checkout
+    now = ts_utc_now()
+    blk = Block(
+        prev_hash=chain.last_hash(),
+        timestamp=now,
+        case_id=b"\x00" * 32,  # will be filled by looking up last case of this item
+        evidence_id=encode_item_id(item_id),
+        state=pad12(b"CHECKEDOUT"),
+        creator=pad12(role.encode()),
+        owner=pad12(role.encode()),
+        data=b"",
+    )
+    chain.append(blk)
+    print(f"> Checked out item: {item_id}")
+    print("> Status: CHECKEDOUT")
+    print(f"> Time of action: {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))}Z")
+    sys.exit(0)
+
+
+def cmd_checkin(chain: Blockchain, item_id: int, pw: str) -> None:
+    role = require_owner(pw)
+    # TODO: ensure item exists and was previously CHECKEDOUT
+    now = ts_utc_now()
+    blk = Block(
+        prev_hash=chain.last_hash(),
+        timestamp=now,
+        case_id=b"\x00" * 32,
+        evidence_id=encode_item_id(item_id),
+        state=pad12(b"CHECKEDIN"),
+        creator=pad12(role.encode()),
+        owner=pad12(role.encode()),
+        data=b"",
+    )
+    chain.append(blk)
+    print(f"> Checked in item: {item_id}")
+    print("> Status: CHECKEDIN")
+    print(f"> Time of action: {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))}Z")
+    sys.exit(0)
+
+
+def cmd_show_cases(chain: Blockchain, pw: str) -> None:
+    require_owner(pw)
+    # TODO: collect unique case IDs from blocks
+    seen = set()
+    for b in chain.read_all():
+        if b.case_id.strip(b"\x00"):
+            seen.add(b.case_id)
+    if not seen:
+        print("")
+        sys.exit(0)
+    for c in seen:
+        print(f"> Case: {binascii.hexlify(c).decode()}")
+    sys.exit(0)
+
+
+def cmd_show_items(chain: Blockchain, case_id: str, pw: str) -> None:
+    require_owner(pw)
+    # TODO: filter items by case_id (need to match encrypted form)
+    enc_case = encode_case_id(case_id)
+    items = set()
+    for b in chain.read_all():
+        if b.case_id == enc_case and b.evidence_id.strip(b"\x00"):
+            maybe = decode_item_id(b.evidence_id)
+            items.add(maybe if maybe is not None else binascii.hexlify(b.evidence_id).decode())
+    for iid in items:
+        print(f"> Item: {iid}")
+    sys.exit(0)
+
+
+def cmd_show_history(chain: Blockchain, case_id: Optional[str], item_id: Optional[int], n: Optional[int], reverse: bool, pw: Optional[str]) -> None:
+    # If password missing or invalid, show encrypted values per spec (but still show entries)
+    role = _role_for_password(pw) if pw else None
+    blks = chain.read_all()
+    # Filter
+    def matches(b: Block) -> bool:
+        ok = True
+        if case_id:
+            ok = ok and (b.case_id == encode_case_id(case_id))
+        if item_id is not None:
+            ok = ok and (b.evidence_id.startswith(encode_item_id(item_id)[:4]))  # loose match; refine in TODO
+        return ok
+    ent = [b for b in blks if matches(b) and b.state != pad12(b"INITIAL")]
+    ent.sort(key=lambda x: x.timestamp)
+    if reverse:
+        ent.reverse()
+    if n is not None:
+        ent = ent[:n]
+    for b in ent:
+        case_out = decode_case_id(b.case_id) if role in OWNERS else binascii.hexlify(b.case_id).decode()
+        item_out = (
+            str(decode_item_id(b.evidence_id)) if role in OWNERS else binascii.hexlify(b.evidence_id).decode()
+        )
+        print(f"> Case: {case_out}")
+        print(f"> Item: {item_out}")
+        print(f"> Action: {b.state.decode(errors='ignore')}")
+        print(f"> Time: {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(b.timestamp))}Z\n")
+    sys.exit(0)
+
+
+def cmd_remove(chain: Blockchain, item_id: int, why: str, owner_txt: Optional[str], pw: str) -> None:
+    require_creator(pw)
+    if why not in {"DISPOSED", "DESTROYED", "RELEASED"}:
+        print("> Invalid remove reason", file=sys.stdout)
+        sys.exit(1)
+    if why == "RELEASED" and not owner_txt:
+        print("> RELEASED requires -o/--owner", file=sys.stdout)
+        sys.exit(1)
+    # TODO: ensure item exists and is currently CHECKEDIN
+    now = ts_utc_now()
+    data = (owner_txt or "").encode()
+    blk = Block(
+        prev_hash=chain.last_hash(),
+        timestamp=now,
+        case_id=b"\x00" * 32,
+        evidence_id=encode_item_id(item_id),
+        state=pad12(why.encode()),
+        creator=pad12(b"CREATOR"),
+        owner=pad12(b""),
+        data=data,
+    )
+    chain.append(blk)
+    print(f"> Removed item: {item_id}")
+    print(f"> Status: {why}")
+    print(f"> Time of action: {time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now))}Z")
+    sys.exit(0)
+
+
+def cmd_verify(chain: Blockchain) -> None:
+    blks = chain.read_all()
+    if not blks:
+        print("> Transactions in blockchain: 0")
+        print("> State of blockchain: CLEAN")
+        sys.exit(0)
+    # Basic single-error verification skeleton (extend per spec test cases)
+    # 1) Check INITIAL block
+    if not blks[0].state.startswith(b"INITIAL"):
+        print("> Transactions in blockchain: {}".format(len(blks)))
+        print("> State of blockchain: ERROR")
+        print("> Bad block: INITIAL invalid")
+        sys.exit(1)
+    # 2) Parent linkage and checksum
+    parent_hash = blks[0].hash()
+    for i in range(1, len(blks)):
+        b = blks[i]
+        if b.prev_hash != parent_hash:
+            print("> Transactions in blockchain: {}".format(len(blks)))
+            print("> State of blockchain: ERROR")
+            print(f"> Bad block: {binascii.hexlify(b.hash()).decode()}")
+            print("> Parent block: NOT FOUND")
+            sys.exit(1)
+        parent_hash = b.hash()
+    print("> Transactions in blockchain: {}".format(len(blks)))
+    print("> State of blockchain: CLEAN")
+    sys.exit(0)
+
+
+def cmd_summary(chain: Blockchain, case_id: Optional[str]) -> None:
+    # Iterate and count per state; filter by case_id if provided
+    enc_case = encode_case_id(case_id) if case_id else None
+    unique_items = set()
+    cnt = {s: 0 for s in ["CHECKEDIN", "CHECKEDOUT", "DISPOSED", "DESTROYED", "RELEASED"]}
+    for b in chain.read_all():
+        if enc_case and b.case_id != enc_case:
+            continue
+        if b.evidence_id.strip(b"\x00"):
+            unique_items.add(b.evidence_id)
+        s = b.state.decode(errors="ignore")
+        if s in cnt:
+            cnt[s] += 1
+    print(f"> Unique items: {len(unique_items)}")
+    for k in ["CHECKEDIN", "CHECKEDOUT", "DISPOSED", "DESTROYED", "RELEASED"]:
+        print(f"> {k}: {cnt[k]}")
+    sys.exit(0)
+
+
+# --------------------------- CLI ---------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="bchoc", add_help=True)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # init
+    sub.add_parser("init")
+
+    # add
+    pa = sub.add_parser("add")
+    pa.add_argument("-c", "--case", dest="case_id", required=True)
+    pa.add_argument("-i", "--item", dest="item_ids", type=int, nargs="+", required=True)
+    pa.add_argument("-g", "--creator", dest="creator", required=True)
+    pa.add_argument("-p", "--password", dest="password", required=True)
+
+    # checkout
+    pco = sub.add_parser("checkout")
+    pco.add_argument("-i", "--item", dest="item_id", type=int, required=True)
+    pco.add_argument("-p", "--password", dest="password", required=True)
+
+    # checkin
+    pci = sub.add_parser("checkin")
+    pci.add_argument("-i", "--item", dest="item_id", type=int, required=True)
+    pci.add_argument("-p", "--password", dest="password", required=True)
+
+    # show cases
+    psc = sub.add_parser("show")
+    psc_sub = psc.add_subparsers(dest="show_what", required=True)
+    psc_cases = psc_sub.add_parser("cases")
+    psc_cases.add_argument("-p", "--password", dest="password", required=True)
+    psc_items = psc_sub.add_parser("items")
+    psc_items.add_argument("-c", "--case", dest="case_id", required=True)
+    psc_items.add_argument("-p", "--password", dest="password", required=True)
+    psc_hist = psc_sub.add_parser("history")
+    psc_hist.add_argument("-c", "--case", dest="case_id")
+    psc_hist.add_argument("-i", "--item", dest="item_id", type=int)
+    psc_hist.add_argument("-n", dest="num_entries", type=int)
+    psc_hist.add_argument("-r", "--reverse", action="store_true")
+    psc_hist.add_argument("-p", "--password", dest="password")
+
+    # remove
+    prm = sub.add_parser("remove")
+    prm.add_argument("-i", "--item", dest="item_id", type=int, required=True)
+    prm.add_argument("-y", "--why", dest="why", required=True, choices=["DISPOSED", "DESTROYED", "RELEASED"])
+    prm.add_argument("-o", "--owner", dest="owner")
+    prm.add_argument("-p", "--password", dest="password", required=True)
+
+    # verify
+    sub.add_parser("verify")
+
+    # summary
+    psu = sub.add_parser("summary")
+    psu.add_argument("-c", "--case", dest="case_id")
+
+    return p
+
+
+def main(argv: List[str]) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+        chain = Blockchain(BCHOC_FILE_PATH)
+
+        if args.cmd == "init":
+            cmd_init(chain)
+        elif args.cmd == "add":
+            cmd_add(chain, args.case_id, args.item_ids, args.creator, args.password)
+        elif args.cmd == "checkout":
+            cmd_checkout(chain, args.item_id, args.password)
+        elif args.cmd == "checkin":
+            cmd_checkin(chain, args.item_id, args.password)
+        elif args.cmd == "show":
+            if args.show_what == "cases":
+                cmd_show_cases(chain, args.password)
+            elif args.show_what == "items":
+                cmd_show_items(chain, args.case_id, args.password)
+            elif args.show_what == "history":
+                cmd_show_history(chain, getattr(args, "case_id", None), getattr(args, "item_id", None), getattr(args, "num_entries", None), getattr(args, "reverse", False), getattr(args, "password", None))
+        elif args.cmd == "remove":
+            cmd_remove(chain, args.item_id, args.why, args.owner, args.password)
+        elif args.cmd == "verify":
+            cmd_verify(chain)
+        elif args.cmd == "summary":
+            cmd_summary(chain, getattr(args, "case_id", None))
+        else:
+            print("unknown command", file=sys.stderr)
+            return 1
+        return 0
+    except SystemExit as e:
+        # argparse or explicit sys.exit
+        return int(e.code) if isinstance(e.code, int) else 1
+    except Exception as e:
+        print(f"> ERROR: {e}", file=sys.stdout)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
